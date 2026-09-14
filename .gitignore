@@ -1,0 +1,14 @@
+# build output
+/libfprint-src/
+/builddir/
+*.o
+*.so
+*.so.*
+
+# python
+__pycache__/
+*.pyc
+
+# editor / os
+*~
+.DS_Store

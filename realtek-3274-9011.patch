@@ -1,0 +1,114 @@
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 104ce5e..b62b4ba 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -278,6 +278,7 @@ usb:v0BDAp5813*
+ usb:v0BDAp5816*
+ usb:v2541pFA03*
+ usb:v3274p9003*
++usb:v3274p9011*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
+diff --git a/libfprint/drivers/realtek/realtek.c b/libfprint/drivers/realtek/realtek.c
+index a41b0ba..fc7f820 100644
+--- a/libfprint/drivers/realtek/realtek.c
++++ b/libfprint/drivers/realtek/realtek.c
+@@ -26,11 +26,19 @@
+ 
+ G_DEFINE_TYPE (FpiDeviceRealtek, fpi_device_realtek, FP_TYPE_DEVICE)
+ 
++/* 3274:9011 refuses access to the on-chip template store while "system 1"
++ * is selected: GET_TEMPLATE (0x45 0x0e) then answers with error status 0x01,
++ * which makes every enrollment fail with "Status check failed" (the template
++ * table cannot be read to locate a free slot).  Selecting system 0 instead
++ * keeps the store readable; the capture/verify command path is unaffected. */
++#define REALTEK_QUIRK_SELECT_OS_0 1
++
+ static const FpIdEntry id_table[] = {
+   { .vid = 0x0bda,  .pid = 0x5813,  },
+   { .vid = 0x0bda,  .pid = 0x5816,  },
+   { .vid = 0x2541,  .pid = 0xfa03,  },
+   { .vid = 0x3274,  .pid = 0x9003,  },
++  { .vid = 0x3274,  .pid = 0x9011,  .driver_data = REALTEK_QUIRK_SELECT_OS_0 },
+   { .vid = 0,  .pid = 0,  .driver_data = 0 },   /* terminating entry */
+ };
+ 
+@@ -170,8 +178,12 @@ fp_finish_capture_cb (FpiDeviceRealtek *self,
+     }
+   else
+     {
+-      fpi_ssm_jump_to_state (self->task_ssm,
+-                             fpi_ssm_get_cur_state (self->task_ssm));
++      /* Poll for the finger.  Re-entering the state immediately would issue
++       * capture-status commands as fast as the USB stack allows (thousands
++       * per second), which needlessly hammers the sensor; pace it instead. */
++      fpi_ssm_jump_to_state_delayed (self->task_ssm,
++                                     fpi_ssm_get_cur_state (self->task_ssm),
++                                     FP_RTK_CAPTURE_POLL_MS);
+     }
+ }
+ 
+@@ -1149,7 +1161,11 @@ fp_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+       break;
+ 
+     case FP_RTK_INIT_SELECT_OS:
+-      co_select_system.param[0] = 0x01;
++      if (fpi_device_get_driver_data (device) & REALTEK_QUIRK_SELECT_OS_0)
++        co_select_system.param[0] = 0x00;
++      else
++        co_select_system.param[0] = 0x01;
++
+       cmd_buf = (guint8 *) &co_select_system;
+       rtk_sensor_bulk_cmd (self, cmd_buf, NULL, FP_RTK_MSG_DEFAULT, 0, fp_task_ssm_generic_cb);
+       break;
+@@ -1256,12 +1272,10 @@ dev_probe (FpDevice *device)
+       return;
+     }
+ 
+-  if (!g_usb_device_reset (usb_dev, &error))
+-    {
+-      g_usb_device_close (usb_dev, NULL);
+-      fpi_device_probe_complete (device, NULL, NULL, error);
+-      return;
+-    }
++  /* Deliberately no reset here.  This sensor re-enumerates when reset, which
++   * leaves the GUsbDevice handle stale and made probing fail intermittently
++   * with "USB error ... Operation timed out".  Reading the descriptors needs
++   * no reset; dev_init() still resets before the sensor is used. */
+ 
+   if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
+     {
+@@ -1293,11 +1307,13 @@ dev_init (FpDevice *device)
+   GError *error = NULL;
+ 
+   G_DEBUG_HERE ();
+-  if (!g_usb_device_reset (fpi_device_get_usb_device (device), &error))
+-    {
+-      fpi_device_open_complete (FP_DEVICE (self), error);
+-      return;
+-    }
++  /* NOTE: no g_usb_device_reset() here.
++   *
++   * This sensor re-enumerates when it is reset, which leaves the GUsbDevice
++   * handle stale; the following claim/commands then fail intermittently with
++   * "transfer timed out".  Opening the device without a reset was verified to
++   * be reliable, and the init sequence below (select system + read state)
++   * already puts the sensor into a known state, so the reset is not needed. */
+ 
+   /* Claim usb interface */
+   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0, &error))
+diff --git a/libfprint/drivers/realtek/realtek.h b/libfprint/drivers/realtek/realtek.h
+index 5658e05..c83eeb3 100644
+--- a/libfprint/drivers/realtek/realtek.h
++++ b/libfprint/drivers/realtek/realtek.h
+@@ -47,6 +47,9 @@
+ #define DATA_TIMEOUT 5000
+ #define STATUS_TIMEOUT 2000
+ 
++/* Delay between capture-status polls while waiting for a finger :ms */
++#define FP_RTK_CAPTURE_POLL_MS 20
++
+ #define MAX_ENROLL_SAMPLES 8
+ #define DEFAULT_UID_LEN 28
+ #define SUB_FINGER_01 0xFF

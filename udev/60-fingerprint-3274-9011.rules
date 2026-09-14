@@ -1,0 +1,23 @@
+# /etc/udev/rules.d/60-fingerprint-3274-9011.rules
+#
+# Microarray / Realtek "USB2.0 Finger Print Bridge" MOC fingerprint sensor
+# (USB 3274:9011, as used by the MicroarrayMocWbdi Windows driver package).
+#
+# Grants the locally logged-in user (systemd-logind "uaccess") read/write
+# access to the sensor, so libfprint and debugging tools can be used without
+# root. fprintd itself runs as root and is unaffected.
+#
+# Install with:
+#   sudo install -m 0644 60-fingerprint-3274-9011.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+ACTION!="add|change", GOTO="fp_3274_9011_end"
+SUBSYSTEM!="usb", GOTO="fp_3274_9011_end"
+
+# 3274:9011 - the sensor this workspace targets
+ATTRS{idVendor}=="3274", ATTRS{idProduct}=="9011", MODE="0660", TAG+="uaccess"
+
+# 3274:9008 - sibling device covered by the same Windows driver INF
+ATTRS{idVendor}=="3274", ATTRS{idProduct}=="9008", MODE="0660", TAG+="uaccess"
+
+LABEL="fp_3274_9011_end"
