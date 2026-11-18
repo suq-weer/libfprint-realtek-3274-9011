@@ -1,8 +1,8 @@
 diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
-index 104ce5e..b62b4ba 100644
+index dcf2d11..bc385d7 100644
 --- a/data/autosuspend.hwdb
 +++ b/data/autosuspend.hwdb
-@@ -278,6 +278,7 @@ usb:v0BDAp5813*
+@@ -272,6 +272,7 @@ usb:v0BDAp5813*
  usb:v0BDAp5816*
  usb:v2541pFA03*
  usb:v3274p9003*
@@ -11,7 +11,7 @@ index 104ce5e..b62b4ba 100644
   ID_PERSIST=0
  
 diff --git a/libfprint/drivers/realtek/realtek.c b/libfprint/drivers/realtek/realtek.c
-index a41b0ba..fc7f820 100644
+index d207c28..373fb1d 100644
 --- a/libfprint/drivers/realtek/realtek.c
 +++ b/libfprint/drivers/realtek/realtek.c
 @@ -26,11 +26,19 @@
@@ -49,7 +49,117 @@ index a41b0ba..fc7f820 100644
      }
  }
  
-@@ -1149,7 +1161,11 @@ fp_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+@@ -209,42 +221,33 @@ fp_accept_sample_cb (FpiDeviceRealtek *self,
+           return;
+         }
+ 
+-      if (self->enroll_stage < self->max_enroll_stage)
++      if (in_status == FP_RTK_SUCCESS)
+         {
+-          if (in_status == FP_RTK_SUCCESS)
+-            {
+-              self->enroll_stage++;
+-              fpi_device_enroll_progress (FP_DEVICE (self), self->enroll_stage, NULL, NULL);
+-              fpi_ssm_jump_to_state (self->task_ssm, FP_RTK_ENROLL_CAPTURE);
+-            }
+-          else if (in_status == FP_RTK_MATCH_FAIL)
+-            {
+-              fpi_ssm_mark_failed (self->task_ssm,
+-                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+-                                                             "InStatus invalid!"));
+-            }
+-          else
+-            {
+-              fpi_device_enroll_progress (FP_DEVICE (self),
+-                                          self->enroll_stage,
+-                                          NULL,
+-                                          fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++          self->enroll_stage++;
++          fpi_device_enroll_progress (FP_DEVICE (self), self->enroll_stage, NULL, NULL);
+ 
+-              fpi_ssm_jump_to_state (self->task_ssm, FP_RTK_ENROLL_CAPTURE);
+-            }
+-          return;
++          /* The last accepted sample completes enrollment: move on to the
++           * duplicate check instead of requesting yet another capture. */
++          if (self->enroll_stage < self->max_enroll_stage)
++            fpi_ssm_jump_to_state (self->task_ssm, FP_RTK_ENROLL_CAPTURE);
++          else
++            fpi_ssm_next_state (self->task_ssm);
+         }
+-
+-      if (in_status != FP_RTK_SUCCESS)
++      else if (in_status == FP_RTK_MATCH_FAIL)
+         {
+           fpi_ssm_mark_failed (self->task_ssm,
+                                fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+-                                                         "Enrollment failed (status 0x%02x)",
+-                                                         in_status));
+-          return;
++                                                         "InStatus invalid!"));
+         }
++      else
++        {
++          fpi_device_enroll_progress (FP_DEVICE (self),
++                                      self->enroll_stage,
++                                      NULL,
++                                      fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+ 
+-      fpi_ssm_next_state (self->task_ssm);
++          fpi_ssm_jump_to_state (self->task_ssm, FP_RTK_ENROLL_CAPTURE);
++        }
+     }
+ }
+ 
+@@ -909,8 +912,9 @@ fp_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   fp_info ("Verify complete!");
+ 
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
++  /* The @error argument is already a copy owned by the caller; using
++   * fpi_ssm_get_error() here would hand out a pointer that is freed right
++   * after this callback returns (use-after-free in fprintd). */
+ 
+   if (error && error->domain == FP_DEVICE_RETRY)
+     {
+@@ -936,8 +940,9 @@ fp_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   fp_info ("Enrollment complete!");
+ 
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
++  /* The @error argument is already a copy owned by the caller; using
++   * fpi_ssm_get_error() here would hand out a pointer that is freed right
++   * after this callback returns (use-after-free in fprintd). */
+ 
+   if (error)
+     {
+@@ -958,8 +963,9 @@ fp_init_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   fp_info ("Init complete!");
+ 
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
++  /* The @error argument is already a copy owned by the caller; using
++   * fpi_ssm_get_error() here would hand out a pointer that is freed right
++   * after this callback returns (use-after-free in fprintd). */
+ 
+   fpi_device_open_complete (dev, error);
+   self->task_ssm = NULL;
+@@ -972,8 +978,9 @@ fp_delete_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   fp_info ("Delete print complete!");
+ 
+-  if (fpi_ssm_get_error (ssm))
+-    error = fpi_ssm_get_error (ssm);
++  /* The @error argument is already a copy owned by the caller; using
++   * fpi_ssm_get_error() here would hand out a pointer that is freed right
++   * after this callback returns (use-after-free in fprintd). */
+ 
+   fpi_device_delete_complete (dev, error);
+   self->task_ssm = NULL;
+@@ -1161,7 +1168,11 @@ fp_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
        break;
  
      case FP_RTK_INIT_SELECT_OS:
@@ -62,7 +172,7 @@ index a41b0ba..fc7f820 100644
        cmd_buf = (guint8 *) &co_select_system;
        rtk_sensor_bulk_cmd (self, cmd_buf, NULL, FP_RTK_MSG_DEFAULT, 0, fp_task_ssm_generic_cb);
        break;
-@@ -1256,12 +1272,10 @@ dev_probe (FpDevice *device)
+@@ -1268,12 +1279,10 @@ dev_probe (FpDevice *device)
        return;
      }
  
@@ -79,7 +189,7 @@ index a41b0ba..fc7f820 100644
  
    if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
      {
-@@ -1293,11 +1307,13 @@ dev_init (FpDevice *device)
+@@ -1305,11 +1314,13 @@ dev_init (FpDevice *device)
    GError *error = NULL;
  
    G_DEBUG_HERE ();
@@ -112,3 +222,16 @@ index 5658e05..c83eeb3 100644
  #define MAX_ENROLL_SAMPLES 8
  #define DEFAULT_UID_LEN 28
  #define SUB_FINGER_01 0xFF
+diff --git a/tests/meson.build b/tests/meson.build
+index aad0675..147fc78 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -292,7 +292,7 @@ else
+         args: ['-c', 'exit 77']
+     )
+ 
+-    foreach driver_test: drivers_tests
++    foreach driver_test, _args : drivers_tests
+         test(driver_test,
+             sh,
+             args: ['-c', 'exit 77']
