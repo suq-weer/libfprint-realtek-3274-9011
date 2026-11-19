@@ -5,8 +5,9 @@ Linux support for the **Microarray / Realtek MOC fingerprint sensor `3274:9011`*
 **Mechrevo Wujie 14**.
 
 Upstream libfprint already ships a `realtek` driver that recognises this sensor,
-but enrollment always fails. This repository contains the reverse-engineered
-root cause, a small patch that fixes it, and the tooling used to work it out.
+but enrollment fails. This repository contains the reverse-engineered root
+cause, a patch that makes `enroll` / `verify` work end-to-end through `fprintd`,
+and the tooling used to work it out.
 
 **English** | [简体中文](README.zh-CN.md)
 
@@ -17,9 +18,9 @@ root cause, a small patch that fixes it, and the tooling used to work it out.
 > ### This was produced by an AI agent
 >
 > Every artifact here — the protocol analysis, the patch, the scripts and this
-> document — was produced by an **AI coding agent (DeepSeek Harness)** working
-> under human direction, by reverse-engineering a Windows driver package and
-> probing real hardware.
+> document — was produced by an **AI coding agent** working under human
+> direction, by reverse-engineering a Windows driver package and probing real
+> hardware.
 >
 > **Consequences you should take seriously:**
 >
@@ -34,8 +35,8 @@ root cause, a small patch that fixes it, and the tooling used to work it out.
 > ### Do not blindly copy commands
 >
 > Read `install.sh` and `build.sh` before running them. They install a library
-> into `/usr/lib64` and restart `fprintd`. Keep a backup and know how to roll
-> back.
+> into the system library path and restart `fprintd`. Keep a backup and know
+> how to roll back.
 >
 > ### Not affiliated
 >
@@ -46,17 +47,19 @@ root cause, a small patch that fixes it, and the tooling used to work it out.
 
 ## Status
 
-Verified on the author's machine (Fedora 44, kernel 6.x):
+Verified on Arch Linux (kernel 7.3.4, `libfprint 1.94.100`, `fprintd 1.94.5`),
+and earlier on Fedora 44:
 
 | Capability | Status | Evidence |
 |---|---|---|
 | libfprint recognises the device | ✅ | `Device name: Realtek USB2.0 Finger Print Bridge` |
 | Init / read template table | ✅ | 10 slots × 35 bytes, status `0x00` |
-| Enroll (libfprint example) | ✅ | `Enroll stage 8 of 8 passed` → `Enrollment complete!` |
-| Verify (libfprint example) | ✅ | `FPI_MATCH_SUCCESS` → `MATCH!` |
-| Clear storage | ✅ | `Clear storage successful!` |
-| **fprintd enroll** | ✅ | `Enroll result: enroll-stage-passed` ×8 → `enroll-completed` |
+| **fprintd enroll** | ✅ | 8 × `enroll-stage-passed` → `enroll-completed` |
 | **fprintd verify** | ✅ | `Verify result: verify-match (done)` |
+| fprintd list | ✅ | `#0: right-index-finger` |
+| Clear storage | ✅ | `Clear storage successful!` |
+| KDE screen lock (Plasma 6.8) | ✅ | fingerprint icon, touch to unlock |
+| Plasma Login Manager | ⚙️ | needs the PAM line below; press Enter on the empty password field, then touch |
 
 ```
 $ fprintd-list $USER
@@ -66,6 +69,9 @@ Fingerprints for user ... on Realtek USB2.0 Finger Print Bridge (press):
 $ fprintd-verify $USER
 Verify result: verify-match (done)
 ```
+
+Enrollment needs **8 accepted samples**. It used to ask for a 9th one and then
+fail the whole enrollment if that sample was rejected; that is fixed here.
 
 ---
 
@@ -113,14 +119,27 @@ and aborts with `Status check failed`. Recovery is immediate:
 > `3`, i.e. on a *non-1* parameter — which is why it appears to work. The
 > handshake is not itself required; the parameter value is what matters.
 
-### Two further issues fixed here
+### Further issues fixed here
 
-1. **USB reset breaks the handle.** `dev_probe()` and `dev_init()` both called
+1. **Dangling `GError` in every SSM completion callback.** `fp_enroll_ssm_done`,
+   `fp_verify_ssm_done`, `fp_init_ssm_done` and `fp_delete_ssm_done` replaced the
+   callback's `error` argument with `fpi_ssm_get_error (ssm)`. That GError is
+   freed when the SSM is destroyed right after the callback returns, so
+   `fprintd` later read `error->message` from freed memory and crashed
+   (`SIGSEGV`) once enrollment finished. The callbacks now use the
+   caller-owned `error` argument.
+2. **Enrollment demanded a 9th sample.** After the 8th accepted sample the
+   driver re-entered the capture state instead of moving on, and any rejected
+   extra capture failed the whole enrollment with
+   `Enrollment failed (status 0x02)`. It now goes straight to the duplicate
+   check after the 8th accepted sample.
+3. **USB reset breaks the handle.** `dev_probe()` and `dev_init()` both called
    `g_usb_device_reset()`. This sensor re-enumerates on reset, leaving the
    `GUsbDevice` handle stale, which caused intermittent
-   `USB error ... Operation timed out`. Raw libusb probes were 9/9 reliable
-   without a reset; removing both resets gave 5/5 probe and 6/6 open success.
-2. **Unthrottled polling.** The capture-status poll re-entered its state
+   `USB error ... Operation timed out`. Removing both resets gave reliable
+   probing and opening; the init sequence puts the sensor into a known state
+   anyway.
+4. **Unthrottled polling.** The capture-status poll re-entered its state
    immediately, producing roughly **8,000 USB transactions per second**
    (45 MB of debug log in 11 s). Paced at 20 ms.
 
@@ -139,14 +158,15 @@ Full protocol details: **[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
 
 ## The patch
 
-`realtek-3274-9011.patch` — 3 files, +34 / −14, applies cleanly to upstream
-libfprint **v1.94.100**.
+`realtek-3274-9011.patch` — 4 files, **+66 / −51**, applies cleanly to upstream
+libfprint **v1.94.100** (verified with `patch --dry-run`).
 
 | File | Change |
 |---|---|
-| `libfprint/drivers/realtek/realtek.c` | add `3274:9011` with `REALTEK_QUIRK_SELECT_OS_0`; drop the two resets |
+| `libfprint/drivers/realtek/realtek.c` | add `3274:9011` with `REALTEK_QUIRK_SELECT_OS_0`; drop the two resets; pace capture polling; fix the four SSM completion callbacks; finish enrollment on the 8th accepted sample |
 | `libfprint/drivers/realtek/realtek.h` | `FP_RTK_CAPTURE_POLL_MS 20` |
 | `data/autosuspend.hwdb` | add `usb:v3274p9011*` |
+| `tests/meson.build` | one-line `foreach` fix required to build v1.94.100 with current meson |
 
 The quirk is gated on `driver_data`, so **no other Realtek model changes
 behaviour**.
@@ -155,62 +175,80 @@ behaviour**.
 
 ## Build & install
 
-Requires: `meson`, `ninja`, `gcc`, `pkg-config` and the dev packages for
-`glib2`, `gusb`, `libusb`, `libgudev`, `openssl`, `pixman`.
-`build.sh` tells you what is missing if you try to build without them.
+Requires `meson`, `ninja`, `gcc`, `pkg-config` and development files for
+`glib2`, `gusb`, `libusb`, `libgudev`, `openssl`, `pixman`. `build.sh` lists
+the exact package names for Fedora, Debian and Arch if something is missing.
 
 ```bash
-git clone https://github.com/RChips22/libfprint-realtek-3274-9011
+git clone https://github.com/suq-weer/libfprint-realtek-3274-9011
 cd libfprint-realtek-3274-9011
 
-./build.sh                 # fetch upstream + apply patch + build (no root needed)
+./build.sh                 # fetch upstream v1.94.100 + apply patch + build (no root)
 sudo ./install.sh          # or: pkexec ./install.sh
 ```
 
-> `build.sh` also works around an **unrelated upstream bug** in libfprint
-> v1.94.100: `tests/meson.build` iterates a dict with a single loop variable,
-> which newer meson rejects (`Foreach expects exactly 2 variables ...`). It was
-> fixed later in master. The workaround is a one-line `sed`, logged when applied,
-> and deliberately kept out of `realtek-3274-9011.patch` so that the patch stays
-> focused enough to upstream.
+`install.sh`:
 
-Then enroll:
+- backs up the current library to
+  `/var/backups/libfprint-2.so.2.0.0.pre-9011`,
+- installs the patched `libfprint-2.so.2.0.0` (`/usr/lib64` on Fedora/Arch,
+  `/usr/lib/x86_64-linux-gnu` on Debian/Ubuntu),
+- runs `ldconfig`, reloads udev/hwdb and restarts `fprintd`.
+
+Then enroll and test:
 
 ```bash
-fprintd-enroll $USER       # press the sensor 8 times
+fprintd-enroll $USER       # touch the sensor 8 times
 fprintd-verify $USER
 fprintd-list   $USER
 ```
 
+### Optional: fingerprint login
+
+The patch only fixes the driver. Login/unlock additionally needs PAM:
+
+- **KDE screen lock** — `kscreenlocker` already ships
+  `/usr/lib/pam.d/kde-fingerprint` with `pam_fprintd`; no configuration needed.
+- **Plasma Login Manager** — add `auth sufficient pam_fprintd.so` to
+  `/etc/pam.d/plasmalogin` (copy it from `/usr/lib/pam.d/` first). Press
+  **Enter** on the empty password field to start the scan; the greeter shows no
+  fingerprint hint yet.
+- **SDDM** — add the same line to `/etc/pam.d/sddm`. SDDM requires typing the
+  password first; the value is then discarded and the sensor takes over.
+
+Modifying PAM changes how you log in. Keep a root shell open and a backup of
+the file.
+
 ### Uninstall / roll back
 
 ```bash
-sudo dnf reinstall libfprint          # Fedora / Copr
-sudo apt install --reinstall libfprint-2-2   # Debian / Ubuntu
+sudo cp -a /var/backups/libfprint-2.so.2.0.0.pre-9011 \
+           /usr/lib/libfprint-2.so.2.0.0     # adjust path if needed
+sudo ldconfig && sudo systemctl restart fprintd
 ```
 
-or restore the backup that `install.sh` made:
+Or reinstall the distribution package:
 
 ```bash
-sudo cp -a /var/backups/libfprint-2.so.2.0.0.pre-9011 /usr/lib64/libfprint-2.so.2.0.0
-sudo ldconfig && sudo systemctl restart fprintd
+sudo pacman -S libfprint            # Arch
+sudo dnf reinstall libfprint        # Fedora
+sudo apt install --reinstall libfprint-2-2   # Debian / Ubuntu
 ```
 
 ---
 
 ## Boundaries — what this does **not** do
 
-- **No PAM configuration.** This reaches the `fprintd` layer only. To use the
-  sensor for login/unlock you must add `pam_fprintd.so` to your PAM stack
-  yourself — that changes authentication behaviour and is your call.
+- **No login manager configuration is shipped.** PAM setup is manual and
+  optional (see above).
 - **No image capture.** Match-on-chip hardware; there are no images to capture.
 - **`identify` (1:N) and single-`delete` were not individually tested.**
   `enroll`, `verify`, `list` and `clear_storage` were.
 - **`3274:9008` is deliberately not enabled.** The Windows INF covers it
   alongside `9011`, but no such hardware was available to test, so the patch
   does not claim support for it.
-- **One machine, one unit.** Timing-sensitive behaviour (the reset race) may
-  differ on other hosts or kernels.
+- **One machine, one unit.** Timing-sensitive behaviour may differ on other
+  hosts or kernels.
 - **No warranty.** See LICENSE.
 
 ---
@@ -244,9 +282,10 @@ but does not redistribute them.
   (© Realtek Corp.), which does the heavy lifting.
 - Prior art consulted: the "4-step handshake" observation from
   [xiaomaogou66/Mechrevo-Wujie14-Unlock](https://github.com/xiaomaogou66/Mechrevo-Wujie14-Unlock).
-  This repository corrects that explanation and fixes two additional bugs.
-- Analysis, patch and documentation produced by an AI agent (DeepSeek Harness)
-  under human direction.
+  This repository corrects that explanation and fixes the additional bugs
+  listed above.
+- Original write-up and tooling: [RChips22/libfprint-realtek-3274-9011](https://github.com/RChips22/libfprint-realtek-3274-9011);
+  this fork adds the `fprintd` enrollment fixes.
 
 If this saves you time, the most useful thing you can do is **get the quirk
 upstreamed to libfprint** so nobody needs a local build.

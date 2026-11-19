@@ -4,7 +4,8 @@
 Finger Print Bridge"）在 Linux 上可用。该传感器见于 **机械革命 无界14** 等机型。
 
 上游 libfprint 的 `realtek` 驱动**本来就能识别**这颗传感器，但录入必然失败。
-本仓库给出逆向得到的根因、修复补丁，以及推导过程所用的工具。
+本仓库给出逆向得到的根因、让 `fprintd` 端的 `enroll` / `verify` 完整跑通的补丁，
+以及推导过程所用的工具。
 
 [English](README.md) | **简体中文**
 
@@ -14,9 +15,8 @@ Finger Print Bridge"）在 Linux 上可用。该传感器见于 **机械革命 �
 >
 > ### 本项目由 AI Agent 制作
 >
-> 这里的所有内容 —— 协议分析、补丁、脚本、文档 —— 都由 **AI 编码 agent
-> （DeepSeek Harness）** 在人类指导下完成，方式是逆向一个 Windows 驱动包
-> 并对真实硬件做探测。
+> 这里的所有内容 —— 协议分析、补丁、脚本、文档 —— 都由 **AI 编码 agent**
+> 在人类指导下完成，方式是逆向一个 Windows 驱动包并对真实硬件做探测。
 >
 > **请认真对待由此带来的后果：**
 >
@@ -30,7 +30,7 @@ Finger Print Bridge"）在 Linux 上可用。该传感器见于 **机械革命 �
 >
 > ### 不要盲目照抄命令
 >
-> 运行前请先读 `install.sh` 和 `build.sh`。它们会把一个库装进 `/usr/lib64`
+> 运行前请先读 `install.sh` 和 `build.sh`。它们会把一个库装进系统库目录
 > 并重启 `fprintd`。请自己留好备份、想清楚怎么回滚。
 >
 > ### 无关联声明
@@ -42,17 +42,19 @@ Finger Print Bridge"）在 Linux 上可用。该传感器见于 **机械革命 �
 
 ## 状态
 
-在作者机器上实测（Fedora 44，kernel 6.x）：
+在 Arch Linux 上实测（kernel 7.3.4，`libfprint 1.94.100`，`fprintd 1.94.5`），
+此前也在 Fedora 44 上验证过：
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
 | libfprint 识别设备 | ✅ | `Device name: Realtek USB2.0 Finger Print Bridge` |
 | 初始化 / 读模板表 | ✅ | 10 槽 × 35 字节，状态 `0x00` |
-| 录入（libfprint 示例） | ✅ | `Enroll stage 8 of 8 passed` → `Enrollment complete!` |
-| 比对（libfprint 示例） | ✅ | `FPI_MATCH_SUCCESS` → `MATCH!` |
-| 清空存储 | ✅ | `Clear storage successful!` |
-| **fprintd 录入** | ✅ | `Enroll result: enroll-stage-passed` ×8 → `enroll-completed` |
+| **fprintd 录入** | ✅ | 8 × `enroll-stage-passed` → `enroll-completed` |
 | **fprintd 比对** | ✅ | `Verify result: verify-match (done)` |
+| fprintd 列表 | ✅ | `#0: right-index-finger` |
+| 清空存储 | ✅ | `Clear storage successful!` |
+| KDE 锁屏（Plasma 6.8） | ✅ | 显示指纹图标，按手指解锁 |
+| Plasma Login Manager | ⚙️ | 需按下方配置 PAM；空密码框按 Enter 后按手指 |
 
 ```
 $ fprintd-list $USER
@@ -62,6 +64,9 @@ Fingerprints for user ... on Realtek USB2.0 Finger Print Bridge (press):
 $ fprintd-verify $USER
 Verify result: verify-match (done)
 ```
+
+录入只需要 **8 次有效按压**。旧代码会再要第 9 次，且第 9 次被拒就导致整轮录入
+失败，本仓库已修复。
 
 ---
 
@@ -105,13 +110,21 @@ co_select_system.param[0] = 0x01;   /* 命令 05 13 */
 > 那个序列恰好**以 `3` 结尾**（即停在一个"非 1"的参数上），这才是它看起来有效的
 > 原因。握手本身并非必需，**决定一切的是参数取值**。
 
-### 本仓库另外修掉的两个问题
+### 本仓库修复的其他问题
 
-1. **USB reset 会让句柄失效。** `dev_probe()` 与 `dev_init()` 都调用了
+1. **所有 SSM 完成回调里的悬垂 `GError`。** `fp_enroll_ssm_done`、
+   `fp_verify_ssm_done`、`fp_init_ssm_done`、`fp_delete_ssm_done` 都用
+   `fpi_ssm_get_error (ssm)` 覆盖了回调参数 `error`。这个 GError 会在回调返回、
+   SSM 随即销毁时被释放，`fprintd` 之后读取 `error->message` 就是释放后使用，
+   录入完成时直接段错误（`SIGSEGV`）。现改为使用调用方持有副本的 `error` 参数。
+2. **录入多要一次采样。** 第 8 次有效采样后驱动仍重新进入采集状态，而下一次采样
+   一旦被拒就以 `Enrollment failed (status 0x02)` 使整轮录入失败。现改为第 8 次
+   有效采样后直接进入重复检查。
+3. **USB reset 会让句柄失效。** `dev_probe()` 与 `dev_init()` 都调用了
    `g_usb_device_reset()`。该传感器在 reset 时会重新枚举，`GUsbDevice` 句柄随即
-   失效，导致间歇性 `USB error ... Operation timed out`。
-   裸 libusb 不加 reset 时 9/9 稳定；去掉两处 reset 后，探针 5/5、打开 6/6 全通过。
-2. **轮询无限速。** 采集状态轮询会立即重入同一状态，实测约
+   失效，导致间歇性 `USB error ... Operation timed out`。去掉两处 reset 后探测
+   与打开均稳定；初始化序列本身已能把传感器置于已知状态。
+4. **轮询无限速。** 采集状态轮询会立即重入同一状态，实测约
    **每秒 8000 次 USB 事务**（11 秒产生 45MB 调试日志）。已改为 20ms 间隔。
 
 ### 以及一处设备侧清理
@@ -127,14 +140,15 @@ co_select_system.param[0] = 0x01;   /* 命令 05 13 */
 
 ## 补丁
 
-`realtek-3274-9011.patch` —— 3 个文件，+34 / −14，可干净应用到上游 libfprint
-**v1.94.100**。
+`realtek-3274-9011.patch` —— 4 个文件，**+66 / −51**，可干净应用到上游 libfprint
+**v1.94.100**（已用 `patch --dry-run` 验证）。
 
 | 文件 | 改动 |
 |---|---|
-| `libfprint/drivers/realtek/realtek.c` | 新增 `3274:9011` 并带 `REALTEK_QUIRK_SELECT_OS_0`；去掉两处 reset |
+| `libfprint/drivers/realtek/realtek.c` | 新增 `3274:9011` 并带 `REALTEK_QUIRK_SELECT_OS_0`；去掉两处 reset；限制轮询频率；修复四个 SSM 完成回调；第 8 次有效采样后结束录入 |
 | `libfprint/drivers/realtek/realtek.h` | `FP_RTK_CAPTURE_POLL_MS 20` |
 | `data/autosuspend.hwdb` | 新增 `usb:v3274p9011*` |
+| `tests/meson.build` | 用当前 meson 构建 v1.94.100 所需的一行 `foreach` 修复 |
 
 quirk 由 `driver_data` 门控，**其他 Realtek 型号行为不变**。
 
@@ -143,23 +157,25 @@ quirk 由 `driver_data` 门控，**其他 Realtek 型号行为不变**。
 ## 构建与安装
 
 需要：`meson`、`ninja`、`gcc`、`pkg-config`，以及 `glib2`、`gusb`、`libusb`、
-`libgudev`、`openssl`、`pixman` 的开发包。缺什么 `build.sh` 会告诉你。
+`libgudev`、`openssl`、`pixman` 的开发包。缺什么 `build.sh` 会给出 Fedora /
+Debian / Arch 对应的包名。
 
 ```bash
-git clone https://github.com/RChips22/libfprint-realtek-3274-9011
+git clone https://github.com/suq-weer/libfprint-realtek-3274-9011
 cd libfprint-realtek-3274-9011
 
-./build.sh                 # 拉取上游 + 打补丁 + 构建（不需要 root）
+./build.sh                 # 拉取上游 v1.94.100 + 打补丁 + 构建（不需要 root）
 sudo ./install.sh          # 或：pkexec ./install.sh
 ```
 
-> `build.sh` 还会顺带绕过 libfprint **v1.94.100 的一个无关上游 bug**：
-> `tests/meson.build` 用单个循环变量遍历 dict，新版 meson 会直接报错
-> （`Foreach expects exactly 2 variables ...`）。该 bug 后来在 master 中已修。
-> 这里用一行 `sed` 处理并在输出中明确提示，**故意不写进
-> `realtek-3274-9011.patch`**，以便补丁保持聚焦、可提交上游。
+`install.sh` 会：
 
-然后录入：
+- 把现有库备份到 `/var/backups/libfprint-2.so.2.0.0.pre-9011`；
+- 安装打过补丁的 `libfprint-2.so.2.0.0`（Fedora/Arch 为 `/usr/lib64`，
+  Debian/Ubuntu 为 `/usr/lib/x86_64-linux-gnu`）；
+- 执行 `ldconfig`，重载 udev/hwdb，并重启 `fprintd`。
+
+然后录入并验证：
 
 ```bash
 fprintd-enroll $USER       # 按传感器 8 次
@@ -167,32 +183,47 @@ fprintd-verify $USER
 fprintd-list   $USER
 ```
 
+### 可选：指纹登录
+
+补丁只修驱动。登录/解锁还需要配置 PAM：
+
+- **KDE 锁屏** —— `kscreenlocker` 自带的 `/usr/lib/pam.d/kde-fingerprint`
+  已包含 `pam_fprintd`，无需配置。
+- **Plasma Login Manager** —— 先从 `/usr/lib/pam.d/` 复制一份
+  `/etc/pam.d/plasmalogin`，加入 `auth sufficient pam_fprintd.so`。在空密码框
+  按 **Enter** 启动扫描；登录界面目前没有指纹提示文字。
+- **SDDM** —— 同样在 `/etc/pam.d/sddm` 加一行。SDDM 会要求先输入密码，
+  密码被丢弃后由传感器接管。
+
+修改 PAM 会改变登录方式。请保持一个 root 终端可用，并备份原文件。
+
 ### 卸载 / 回滚
 
 ```bash
-sudo dnf reinstall libfprint                 # Fedora / Copr
-sudo apt install --reinstall libfprint-2-2   # Debian / Ubuntu
+sudo cp -a /var/backups/libfprint-2.so.2.0.0.pre-9011 \
+           /usr/lib/libfprint-2.so.2.0.0     # 按实际路径调整
+sudo ldconfig && sudo systemctl restart fprintd
 ```
 
-或恢复 `install.sh` 留下的备份：
+或重装发行版自带的包：
 
 ```bash
-sudo cp -a /var/backups/libfprint-2.so.2.0.0.pre-9011 /usr/lib64/libfprint-2.so.2.0.0
-sudo ldconfig && sudo systemctl restart fprintd
+sudo pacman -S libfprint              # Arch
+sudo dnf reinstall libfprint          # Fedora
+sudo apt install --reinstall libfprint-2-2   # Debian / Ubuntu
 ```
 
 ---
 
 ## 边界 —— 本项目**不做**什么
 
-- **不配置 PAM。** 只做到 `fprintd` 这一层。要用指纹登录/解锁，需你自己在 PAM
-  栈里加 `pam_fprintd.so` —— 那会改变认证行为，请自行判断。
+- **不附带登录管理器配置。** PAM 配置是可选手动步骤（见上）。
 - **不提供图像采集。** Match-on-chip 硬件，没有图像可采。
 - **`identify`（1:N）与单条 `delete` 未单独实测。**
   已实测：`enroll`、`verify`、`list`、`clear_storage`。
 - **刻意未启用 `3274:9008`。** Windows INF 里它和 `9011` 同属一个驱动，但手边
   没有该硬件，故补丁不声称支持。
-- **仅一台机器、一台设备。** 时序相关行为（reset 竞态）在其他主机/内核上可能不同。
+- **仅一台机器、一台设备。** 时序相关行为在其他主机/内核上可能不同。
 - **无任何担保。** 见 LICENSE。
 
 ---
@@ -225,8 +256,9 @@ Windows 驱动包（`MicroarrayMocWbdi.dll` 等）**未包含在内** —— 那
   由它完成。
 - 参考的先期观察：「四步握手」一说来自
   [xiaomaogou66/Mechrevo-Wujie14-Unlock](https://github.com/xiaomaogou66/Mechrevo-Wujie14-Unlock)。
-  本仓库修正了该解释，并额外修掉两个 bug。
-- 分析、补丁与文档由 AI agent（DeepSeek Harness）在人类指导下产出。
+  本仓库修正了该解释，并额外修复了上述 bug。
+- 原始分析与工具：[RChips22/libfprint-realtek-3274-9011](https://github.com/RChips22/libfprint-realtek-3274-9011)；
+  本 fork 增加了 `fprintd` 端录入相关修复。
 
 如果这个项目帮到了你，最有价值的事是**把这个 quirk 推到上游 libfprint**，
 这样大家就不必再自己编译。
